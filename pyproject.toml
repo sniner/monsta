@@ -1,0 +1,44 @@
+[project]
+name = "monsta"
+version = "0.1.0"
+description = "Simple monitoring REST API for Python applications"
+readme = "README.md"
+authors = [
+    { name = "Stefan Schönberger", email = "stefan@sniner.dev" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "fastapi>=0.133.1",
+    "pydantic>=2.12.5",
+    "uvicorn>=0.41.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.10.6,<0.11.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "basedpyright>=1.38.2",
+    "pytest>=9.0.2",
+    "ruff>=0.15.3",
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra -q"
+testpaths = [
+    "tests",
+]
+
+[tool.pyright]
+typeCheckingMode = "standard"
+useLibraryCodeForTypes = true
+venvPath = "."
+venv = ".venv"
+
+[tool.ruff]
+line-length = 96
+ignore = ["E402"]
+
+[tool.ruff.lint]
+per-file-ignores = { "__init__.py" = ["F401"] }
