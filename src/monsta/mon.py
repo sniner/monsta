@@ -38,11 +38,12 @@ def _now() -> float:
 
 
 class StatusReporter:
-    def __init__(self, *, endpoint: Optional[str] = None):
+    def __init__(self, *, endpoint: Optional[str] = None, update_holdoff: float = UPDATE_HOLDOFF):
         self._state: MonitoringState = MonitoringState()
         self._state_lock: threading.RLock = threading.RLock()
         self._state_callback: Optional[StateCallback] = None
         self._update_time: float = 0.0
+        self._update_holdoff = update_holdoff
         self._startup_time: float = _now()
 
         self._worker_thread: Optional[threading.Thread] = None
@@ -131,7 +132,7 @@ class StatusReporter:
             # Do not re-raise: a failed internal update must not block user state updates
 
     def _is_throttled(self, now: float) -> bool:
-        if now - self._update_time < UPDATE_HOLDOFF:
+        if now - self._update_time < self._update_holdoff:
             return True
         self._update_time = now
         return False
@@ -228,10 +229,14 @@ class StatusReporter:
         port: Optional[int] = None,
         log_level: Optional[Union[int, str]] = None,
         blocking: bool = False,
+        update_holdoff: Optional[float] = None,
     ) -> None:
         try:
             if self._worker_alive():
                 raise RuntimeError("Monitoring worker already running")
+
+            if update_holdoff is not None:
+                self._update_holdoff = update_holdoff
 
             self.reset()
             self.publish(state or {})
@@ -304,6 +309,7 @@ def start(
     port: Optional[int] = None,
     log_level: Optional[Union[int, str]] = None,
     blocking: bool = False,
+    update_holdoff: Optional[float] = None,
 ) -> None:
     _get_instance().start(
         state=state,
@@ -311,6 +317,7 @@ def start(
         blocking=blocking,
         host=host,
         log_level=log_level,
+        update_holdoff=update_holdoff,
     )
 
 

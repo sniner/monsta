@@ -12,18 +12,18 @@ Check:
     curl http://localhost:4242/mon/v1/state
 """
 
-import time
 import threading
+import time
 
 import uvicorn
 from fastapi import FastAPI
 
-from monsta import AppState, EWMA, LeakyBucket, RunningStats, SlidingWindow, StatusReporter
-
+from monsta import EWMA, AppState, LeakyBucket, RunningStats, SlidingWindow, StatusReporter
 
 # ---------------------------------------------------------------------------
 # Define the application state
 # ---------------------------------------------------------------------------
+
 
 class MyAppState(AppState):
     # Requests per minute (sliding-window counter)
@@ -50,7 +50,7 @@ class MyAppState(AppState):
 app = FastAPI()
 state = MyAppState()
 
-mon = StatusReporter()
+mon = StatusReporter(update_holdoff=0.1)
 app.include_router(mon.router)
 
 # Pass the AppState instance directly – it's callable, so StatusReporter
@@ -61,6 +61,7 @@ mon.publish(state)
 # ---------------------------------------------------------------------------
 # Request handler
 # ---------------------------------------------------------------------------
+
 
 @app.get("/")
 def root():
@@ -76,9 +77,9 @@ def root():
     elapsed_ms = (time.monotonic() - t0) * 1000
 
     # Update metrics – the descriptor __set__ routes values to the right impl
-    state.request_rate = 1           # count one hit in the sliding window
-    state.cpu_usage = 20.0           # fake CPU reading
-    state.latency = elapsed_ms       # add a latency sample
+    state.request_rate = 1  # count one hit in the sliding window
+    state.cpu_usage = 20.0  # fake CPU reading
+    state.latency = elapsed_ms  # add a latency sample
     state.status = "running"
 
     return {"message": "Hello World", "latency_ms": round(elapsed_ms, 2)}
@@ -88,8 +89,10 @@ def root():
 # Background thread that simulates periodic CPU reads
 # ---------------------------------------------------------------------------
 
+
 def _cpu_poller():
     import random
+
     while True:
         state.cpu_usage = random.uniform(10, 80)
         time.sleep(2)

@@ -25,14 +25,14 @@ class AsyncStatusReporter:
     native async/await support, making it ideal for FastAPI applications.
     """
 
-    def __init__(self, *, endpoint: Optional[str] = None):
+    def __init__(self, *, endpoint: Optional[str] = None, update_holdoff: float = UPDATE_HOLDOFF):
         """Initialize an async status reporter.
 
         Args:
             endpoint: Custom endpoint path for the status API
         """
         # Create a synchronous StatusReporter for state management
-        self._sync_agent = StatusReporter(endpoint=endpoint)
+        self._sync_agent = StatusReporter(endpoint=endpoint, update_holdoff=update_holdoff)
 
         # Async-specific components
         self._async_state_callback: Optional[AsyncStateCallback] = None

@@ -33,8 +33,7 @@ def get_state(client: http.client.HTTPConnection) -> dict:
 
 
 # Initialize the monitoring system for tests
-mon.UPDATE_HOLDOFF = 0
-mon.start(blocking=False, state=my_test_state)
+mon.start(blocking=False, state=my_test_state, update_holdoff=0)
 if not _test_event.wait(timeout=1):
     raise Exception("Timeout waiting for initial state update")
 time.sleep(0.1)
