@@ -8,6 +8,7 @@
 - **Async Support**: Native async/await support for FastAPI
 - **Thread-Safe**: Built-in thread safety for concurrent access
 - **Flexible State Management**: Support for both direct state values and callback functions
+- **Structured State**: Declarative `AppState` class with built-in metric fields
 - **Built-in Metrics**: Automatic uptime tracking (and possibly other internal metrics)
 - **Customizable**: Configure endpoint paths, ports, and update intervals
 
@@ -82,6 +83,104 @@ async def root():
     await app.state.mon.publish({"status": "running", "requests": 1})
     return {"message": "Hello World"}
 ```
+
+## Structured Monitoring State
+
+For applications that need richer, continuously-updated metrics, Monsta provides
+`AppState` – a base class that lets you declare metric fields directly on the class
+using Python descriptors. No manual bookkeeping required.
+
+### Defining State
+
+```python
+from monsta import AppState, SlidingWindow, EWMA, RunningStats, LeakyBucket, StatusReporter
+
+class MyState(AppState):
+    request_rate = SlidingWindow(window=60)   # requests per sliding 60-second window
+    cpu_usage    = EWMA(alpha=0.1)            # exponentially-weighted moving average
+    latency      = RunningStats()             # running mean + stddev (Welford)
+
+    def __init__(self):
+        super().__init__()
+        self.rate_limiter = LeakyBucket(capacity=100, leak_rate=10)  # instance attr
+        self.status = "starting"
+```
+
+### Using State
+
+```python
+state = MyState()
+
+mon = StatusReporter()
+mon.publish(state)   # AppState is callable → treated as a state callback
+
+# Update metrics via normal assignment (routed to the field implementation):
+state.request_rate = 1       # adds 1 hit to the sliding window
+state.cpu_usage    = 73.5    # feeds a new EWMA sample
+state.latency      = 42      # adds a latency data point
+
+# Rate limiter is used directly:
+if not state.rate_limiter.request():
+    raise Exception("Rate limit exceeded")
+
+# Plain attributes serialize as-is:
+state.status = "degraded"
+```
+
+`GET /mon/v1/state` will then return:
+
+```json
+{
+  "internal": {"uptime": 42},
+  "state": {
+    "request_rate": 15.3,
+    "cpu_usage": 32.5,
+    "latency": {"n": 100, "mean": 45.2, "stddev": 8.1},
+    "rate_limiter": {"level": 45.0, "capacity": 100, "full": false},
+    "status": "degraded"
+  }
+}
+```
+
+### Field Reference
+
+| Field | Constructor | Assignment | Serialized as |
+|---|---|---|---|
+| `SlidingWindow` | `SlidingWindow(window=60.0)` | Counts `value` hits | `float` – rate over the window |
+| `EWMA` | `EWMA(alpha=0.1)` | Feeds a new sample | `float \| None` – current estimate |
+| `RunningStats` | `RunningStats()` | Adds a data point | `{"n", "mean", "stddev"}` |
+| `LeakyBucket` | `LeakyBucket(capacity, leak_rate)` | n/a – use `.request()` | `{"level", "capacity", "full"}` |
+
+**`SlidingWindow(window)`** – interpolated two-bucket counter. Tracks how many hits
+occurred in the last `window` seconds. Thread-safe.
+
+**`EWMA(alpha)`** – exponentially weighted moving average. `alpha` ∈ `(0, 1]` controls
+smoothing: values near `0` are very smooth, `1` means no smoothing. Returns `None`
+until the first sample arrives.
+
+**`RunningStats()`** – online mean and standard deviation via Welford's algorithm.
+Never stores raw data, so it is constant in memory regardless of sample count.
+
+**`LeakyBucket(capacity, leak_rate)`** – token-bucket rate limiter. The bucket drains
+at `leak_rate` tokens/second. Call `.request(amount=1.0)` to consume tokens; returns
+`True` if allowed, `False` if the bucket would overflow. Use as a plain instance
+attribute in `AppState.__init__`.
+
+### Inheritance
+
+Child classes inherit all parent fields. A child field with the same name shadows the
+parent's field. Each `AppState` instance maintains its own independent field state.
+
+```python
+class BaseState(AppState):
+    cpu = EWMA(alpha=0.1)
+
+class ExtendedState(BaseState):
+    cpu     = RunningStats()   # overrides BaseState.cpu for this class
+    memory  = EWMA(alpha=0.2)
+```
+
+---
 
 ## API Reference
 
@@ -244,36 +343,7 @@ See the `examples/` directory for complete working examples:
 - `embedded_async.py`: Async FastAPI integration
 - `singleton.py`: Singleton usage example
 - `standalone.py`: Standalone monitoring server
-
-## Development
-
-```bash
-# Install development dependencies using uv
-uv sync --dev
-
-# Run tests
-uv run pytest
-```
-
-## Project Structure
-
-```
-src/monsta/
-├── __init__.py          # Main package exports
-├── mon.py              # Synchronous StatusReporter implementation
-├── aiomon.py           # Async StatusReporter implementation
-└── py.typed            # Type annotations
-
-examples/
-├── embedded.py         # Basic FastAPI integration example
-├── embedded_async.py   # Async FastAPI integration example  
-├── singleton.py        # Singleton usage example
-└── standalone.py       # Standalone server example
-
-tests/
-├── test_sync.py       # Synchronous StatusReporter tests
-└── test_async.py      # AsyncStatusReporter tests
-```
+- `appstate.py`: Structured state with `AppState`, `SlidingWindow`, `EWMA`, `RunningStats`, and `LeakyBucket`
 
 ## License
 

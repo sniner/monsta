@@ -102,11 +102,13 @@ class StatusReporter:
         """
         _state: Mapping[str, Any] = {}
         if callable(state):
-            self._state_callback = state
             _state = state()
+            with self._state_lock:
+                self._state_callback = state
             _logger.debug("State callback registered and executed")
         else:
-            self._state_callback = None
+            with self._state_lock:
+                self._state_callback = None
             if isinstance(state, Mapping):
                 _state = dict(state)
             else:
@@ -126,9 +128,9 @@ class StatusReporter:
             self._state.internal.uptime = self._uptime(now)
         except Exception as exc:
             _logger.error("Failed to update internal state: %s", exc)
-            raise
+            # Do not re-raise: a failed internal update must not block user state updates
 
-    def _update_deferred(self, now: float) -> bool:
+    def _is_throttled(self, now: float) -> bool:
         if now - self._update_time < UPDATE_HOLDOFF:
             return True
         self._update_time = now
@@ -142,7 +144,7 @@ class StatusReporter:
         the last update.
         """
         now = _now()
-        if self._update_deferred(now):
+        if self._is_throttled(now):
             return
         try:
             self._update_internal_state(now)
@@ -279,12 +281,15 @@ class StatusReporter:
 
 # Singleton instance
 _instance: Optional[StatusReporter] = None
+_instance_lock = threading.Lock()
 
 
 def _get_instance() -> StatusReporter:
     global _instance
     if _instance is None:
-        _instance = StatusReporter()
+        with _instance_lock:
+            if _instance is None:
+                _instance = StatusReporter()
     return _instance
 
 

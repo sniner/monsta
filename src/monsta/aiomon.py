@@ -6,8 +6,6 @@ import logging
 from typing import Any, Callable, Mapping, Optional, Union
 
 from .mon import (
-    DEFAULT_HOST,
-    DEFAULT_PORT,
     UPDATE_HOLDOFF,
     StateCallback,
     StatusReporter,
@@ -88,7 +86,7 @@ class AsyncStatusReporter:
 
         if self._async_state_callback:
             now = _now()
-            if self._sync_agent._update_deferred(now):
+            if self._sync_agent._is_throttled(now):
                 return
             try:
                 self._sync_agent._update_internal_state(now)
@@ -107,16 +105,12 @@ class AsyncStatusReporter:
         self,
         *,
         state: Optional[AsyncStateType] = None,
-        host: Optional[str] = None,
-        port: Optional[int] = None,
         update_interval: int = UPDATE_HOLDOFF,
     ) -> None:
         """Start the async monitoring agent.
 
         Args:
-            app_state: Initial state or callable to get initial state
-            host: Host address to bind to
-            port: Port number to listen on
+            state: Initial state or callable to get initial state
             update_interval: Interval in seconds for automatic state updates
         """
         try:
@@ -126,16 +120,11 @@ class AsyncStatusReporter:
             self.reset()
             await self.publish(state or {})
 
-            actual_host = host or DEFAULT_HOST
-            actual_port = port or DEFAULT_PORT
-
             # Start the async update task
             self._async_update_task = asyncio.create_task(
                 self._periodic_update_async(update_interval)
             )
-            _logger.info(
-                "Async monitoring agent started successfully on %s:%d", actual_host, actual_port
-            )
+            _logger.info("Async monitoring agent started successfully")
 
         except Exception as exc:
             _logger.error("Failed to start async monitoring agent: %s", exc)
@@ -166,19 +155,7 @@ class AsyncStatusReporter:
                 _logger.info("Async update task cancelled successfully")
 
             # Stop the sync components
-            if self._sync_agent._uvicorn_server:
-                self._sync_agent._uvicorn_server.should_exit = True
-                _logger.info("Signaled uvicorn server to exit")
-
-            if self._sync_agent._worker_thread:
-                self._sync_agent._worker_thread.join(timeout=5)
-                if self._sync_agent._worker_thread.is_alive():
-                    _logger.warning("Monitoring thread did not terminate within timeout")
-                self._sync_agent._worker_thread = None
-                _logger.info("Monitoring thread joined successfully")
-
-            self._sync_agent._uvicorn_server = None
-            _logger.info("Async monitoring agent stopped successfully")
+            self._sync_agent.stop()
         except RuntimeError as re:
             _logger.error("Runtime error during async agent shutdown: %s", re)
         except Exception as exc:

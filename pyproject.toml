@@ -1,12 +1,12 @@
 [project]
 name = "monsta"
-version = "0.1.0"
+version = "0.1.1"
 description = "Simple monitoring REST API for Python applications"
 readme = "README.md"
 authors = [
     { name = "Stefan Schönberger", email = "stefan@sniner.dev" }
 ]
-requires-python = ">=3.14"
+requires-python = ">=3.10"
 dependencies = [
     "fastapi>=0.133.1",
     "pydantic>=2.12.5",
