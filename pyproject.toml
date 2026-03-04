@@ -1,6 +1,6 @@
 [project]
 name = "monsta"
-version = "0.1.2"
+version = "0.1.3"
 description = "Simple monitoring REST API for Python applications"
 readme = "README.md"
 authors = [

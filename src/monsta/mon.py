@@ -38,7 +38,9 @@ def _now() -> float:
 
 
 class StatusReporter:
-    def __init__(self, *, endpoint: Optional[str] = None, update_holdoff: float = UPDATE_HOLDOFF):
+    def __init__(
+        self, *, endpoint: Optional[str] = None, update_holdoff: float = UPDATE_HOLDOFF
+    ):
         self._state: MonitoringState = MonitoringState()
         self._state_lock: threading.RLock = threading.RLock()
         self._state_callback: Optional[StateCallback] = None
@@ -129,13 +131,13 @@ class StatusReporter:
             self._state.internal.uptime = self._uptime(now)
         except Exception as exc:
             _logger.error("Failed to update internal state: %s", exc)
-            # Do not re-raise: a failed internal update must not block user state updates
 
     def _is_throttled(self, now: float) -> bool:
-        if now - self._update_time < self._update_holdoff:
-            return True
-        self._update_time = now
-        return False
+        with self._state_lock:
+            if now - self._update_time < self._update_holdoff:
+                return True
+            self._update_time = now
+            return False
 
     def _update_state(self) -> None:
         """Update the monitoring state if sufficient time has passed.
@@ -148,9 +150,13 @@ class StatusReporter:
         if self._is_throttled(now):
             return
         try:
-            self._update_internal_state(now)
-            if self._state_callback:
-                self._set_state(self._state_callback())
+            callback = None
+            with self._state_lock:
+                self._update_internal_state(now)
+                callback = self._state_callback
+            if callback:
+                new_state = callback()
+                self._set_state(new_state)
         except ValueError as ve:
             _logger.error("Invalid state value during update: %s", ve)
         except RuntimeError as re:
@@ -172,8 +178,8 @@ class StatusReporter:
             error handling to ensure a response is always returned.
         """
         try:
+            self._update_state()
             with self._state_lock:
-                self._update_state()
                 return self._state
         except Exception as exc:
             _logger.error("Failed to provide monitoring status: %s", exc)

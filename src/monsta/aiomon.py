@@ -5,8 +5,13 @@ import inspect
 import logging
 from typing import Any, Callable, Mapping, Optional, Union
 
+from fastapi import APIRouter
+
 from .mon import (
+    DEFAULT_ENDPOINT,
     UPDATE_HOLDOFF,
+    InternalState,
+    MonitoringState,
     StateCallback,
     StatusReporter,
     _now,
@@ -25,12 +30,16 @@ class AsyncStatusReporter:
     native async/await support, making it ideal for FastAPI applications.
     """
 
-    def __init__(self, *, endpoint: Optional[str] = None, update_holdoff: float = UPDATE_HOLDOFF):
+    def __init__(
+        self, *, endpoint: Optional[str] = None, update_holdoff: float = UPDATE_HOLDOFF
+    ):
         """Initialize an async status reporter.
 
         Args:
             endpoint: Custom endpoint path for the status API
         """
+        self._endpoint_path = endpoint or DEFAULT_ENDPOINT
+
         # Create a synchronous StatusReporter for state management
         self._sync_agent = StatusReporter(endpoint=endpoint, update_holdoff=update_holdoff)
 
@@ -38,8 +47,14 @@ class AsyncStatusReporter:
         self._async_state_callback: Optional[AsyncStateCallback] = None
         self._async_update_task: Optional[asyncio.Task] = None
 
-        # Use the sync agent's router
-        self.router = self._sync_agent.router
+        # Add async endpoint to router
+        self.router = APIRouter()
+        self.router.add_api_route(
+            path=self._endpoint_path,
+            endpoint=self._async_api_endpoint,
+            methods=["GET"],
+            response_model=MonitoringState,
+        )
 
     def reset(self) -> None:
         """Reset the monitoring agent to its initial state."""
@@ -101,6 +116,15 @@ class AsyncStatusReporter:
         else:
             self._sync_agent._update_state()
 
+    async def _async_api_endpoint(self) -> MonitoringState:
+        try:
+            await self._update_state_async()
+            with self._sync_agent._state_lock:
+                return self._sync_agent._state
+        except Exception as exc:
+            _logger.error("Failed to provide monitoring status: %s", exc)
+            return MonitoringState(internal=InternalState(uptime=self._sync_agent._uptime()))
+
     async def start(
         self,
         *,
@@ -114,7 +138,7 @@ class AsyncStatusReporter:
             update_interval: Interval in seconds for automatic state updates
         """
         try:
-            if self._sync_agent._worker_alive():
+            if self._async_update_task is not None and not self._async_update_task.done():
                 raise RuntimeError("Monitoring agent already running")
 
             self.reset()
@@ -154,8 +178,8 @@ class AsyncStatusReporter:
                 self._async_update_task = None
                 _logger.info("Async update task cancelled successfully")
 
-            # Stop the sync components
-            self._sync_agent.stop()
+            # Reset the sync agent state
+            self._sync_agent.reset()
         except RuntimeError as re:
             _logger.error("Runtime error during async agent shutdown: %s", re)
         except Exception as exc:
