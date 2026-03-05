@@ -27,9 +27,7 @@ class InternalState(BaseModel):
 
 
 class MonitoringState(BaseModel):
-    # "internal" holds library-generated stats (like uptime)
     internal: InternalState = Field(default_factory=InternalState)
-    # "state" holds the application state
     state: StateValue = {}
 
 
@@ -39,7 +37,10 @@ def _now() -> float:
 
 class StatusReporter:
     def __init__(
-        self, *, endpoint: Optional[str] = None, update_holdoff: float = UPDATE_HOLDOFF
+        self,
+        *,
+        endpoint: Optional[str] = None,
+        update_holdoff: float = UPDATE_HOLDOFF,
     ):
         self._state: MonitoringState = MonitoringState()
         self._state_lock: threading.RLock = threading.RLock()
@@ -60,14 +61,7 @@ class StatusReporter:
         )
 
     def reset(self) -> None:
-        """Reset the monitoring agent to its initial state.
-
-        Clears all state variables and resets timers, but does not stop
-        any running threads. Use stop() method to stop the monitoring agent.
-
-        Note: This method does NOT kill the monitoring thread.
-        Use stop() or restart() for thread management.
-        """
+        """Reset state and timers. Does not stop a running server; call stop() first."""
         with self._state_lock:
             self._state = MonitoringState()
             self._update_time = 0.0
@@ -75,13 +69,7 @@ class StatusReporter:
         _logger.debug("State reset")
 
     def _set_state(self, state: StateValue) -> None:
-        """Internal method to update the state with thread safety.
-
-        Args:
-            state: The state data to set, as a mapping/dictionary
-        """
-        with self._state_lock:
-            self._state.state = state
+        self._state.state = state
         _logger.debug("State updated: %r", state)
 
     def publish(self, state: StateSource) -> Self:
@@ -103,60 +91,47 @@ class StatusReporter:
                 return {"status": "running", "count": get_count()}
             agent.publish(get_current_state)
         """
-        _state: Mapping[str, Any] = {}
-        if callable(state):
-            _state = state()
-            with self._state_lock:
+        with self._state_lock:
+            if callable(state):
+                _state = state()
                 self._state_callback = state
-            _logger.debug("State callback registered and executed")
-        else:
-            with self._state_lock:
-                self._state_callback = None
-            if isinstance(state, Mapping):
-                _state = dict(state)
+                _logger.debug("State callback registered and executed")
             else:
-                _logger.warning("Unsupported state value: %r", state)
-        self._set_state(_state)
+                self._state_callback = None
+                if isinstance(state, Mapping):
+                    _state = dict(state)
+                else:
+                    _logger.warning("Unsupported state value: %r", state)
+                    _state = {}
+            self._set_state(_state)
         return self
 
     def _uptime(self, now: Optional[float] = None) -> int:
         return int((now or _now()) - self._startup_time)
 
     def _update_internal_state(self, now: Optional[float] = None) -> None:
-        """Update the internal state with global monitoring information.
-
-        Updates system-level monitoring data like uptime.
-        """
         try:
             self._state.internal.uptime = self._uptime(now)
         except Exception as exc:
             _logger.error("Failed to update internal state: %s", exc)
 
     def _is_throttled(self, now: float) -> bool:
-        with self._state_lock:
-            if now - self._update_time < self._update_holdoff:
-                return True
-            self._update_time = now
-            return False
+        if now - self._update_time < self._update_holdoff:
+            return True
+        self._update_time = now
+        return False
 
     def _update_state(self) -> None:
-        """Update the monitoring state if sufficient time has passed.
-
-        This method implements rate-limiting to prevent excessive state updates.
-        Only updates the state if UPDATE_HOLDOFF seconds have passed since
-        the last update.
-        """
         now = _now()
-        if self._is_throttled(now):
-            return
         try:
-            callback = None
             with self._state_lock:
+                if self._is_throttled(now):
+                    return
                 self._update_internal_state(now)
                 callback = self._state_callback
-            if callback:
-                new_state = callback()
-                self._set_state(new_state)
+                if callback:
+                    new_state = callback()
+                    self._set_state(new_state)
         except ValueError as ve:
             _logger.error("Invalid state value during update: %s", ve)
         except RuntimeError as re:
@@ -165,25 +140,12 @@ class StatusReporter:
             _logger.error("Unexpected error during state update: %s", exc)
 
     def _api_endpoint(self) -> MonitoringState:
-        """Get the current monitoring status.
-
-        Returns the complete monitoring state including both internal
-        monitoring data and application state.
-
-        Returns:
-            Dict[str, Any]: Dictionary containing 'internal' and 'state' keys
-
-        Note:
-            This method is called by the FastAPI endpoint and implements
-            error handling to ensure a response is always returned.
-        """
         try:
             self._update_state()
             with self._state_lock:
                 return self._state
         except Exception as exc:
             _logger.error("Failed to provide monitoring status: %s", exc)
-            # Return minimal state even on error
             return MonitoringState(internal=InternalState(uptime=self._uptime()))
 
     def _worker(
@@ -192,16 +154,6 @@ class StatusReporter:
         port: int,
         log_level: Optional[Union[int, str]] = None,
     ) -> None:
-        """Main monitoring worker thread function.
-
-        Starts the FastAPI application with uvicorn server and handles
-        the monitoring endpoint.
-
-        Args:
-            host: Host address to bind to
-            port: Port number to listen on
-            log_level: Logging level for uvicorn
-        """
         try:
             app = FastAPI()
             app.include_router(self.router)
@@ -216,7 +168,6 @@ class StatusReporter:
 
             _logger.info("Starting monitoring worker on %s:%d", host, port)
 
-            # Update state once on startup
             self._update_state()
 
             self._uvicorn_server.run()
@@ -290,7 +241,6 @@ class StatusReporter:
             _logger.error("Unexpected error during worker shutdown: %s", exc)
 
 
-# Singleton instance
 _instance: Optional[StatusReporter] = None
 _instance_lock = threading.Lock()
 
@@ -332,5 +282,5 @@ def stop() -> None:
 
 
 def reset() -> None:
-    """Reset the global agent state. For testing purposes only."""
+    """Reset the global singleton state."""
     _get_instance().reset()

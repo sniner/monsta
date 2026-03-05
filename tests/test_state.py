@@ -5,16 +5,24 @@ Unit tests for AppState, SlidingWindow, EWMA, RunningStats, and LeakyBucket.
 from __future__ import annotations
 
 import json
-import math
 import threading
 import time
 import unittest
 
-from monsta import AppState, EWMA, LeakyBucket, RunningStats, SlidingWindow
+from monsta import (
+    EWMA,
+    AppState,
+    LeakyBucket,
+    RunningStats,
+    SampledWindow,
+    SlidingWindow,
+)
 from monsta.fields import (
     EWMAImpl,
-    LeakyBucket,
+    LeakyBucketImpl,
     RunningStatsImpl,
+    SampledWindowImpl,
+    ScalarField,
     SlidingWindowImpl,
 )
 
@@ -110,8 +118,8 @@ class TestRunningStats(unittest.TestCase):
         self.assertEqual(result["n"], 0)
         self.assertAlmostEqual(result["mean"], 0.0)
         self.assertAlmostEqual(result["stddev"], 0.0)
-        self.assertIsNone(result["min"])
-        self.assertIsNone(result["max"])
+        self.assertAlmostEqual(result["min"], 0.0)
+        self.assertAlmostEqual(result["max"], 0.0)
 
     def test_single_value(self):
         impl = self._make_impl()
@@ -148,24 +156,24 @@ class TestRunningStats(unittest.TestCase):
 
 class TestLeakyBucket(unittest.TestCase):
     def test_allow_within_capacity(self):
-        lb = LeakyBucket(capacity=5.0, leak_rate=1.0)
+        lb = LeakyBucketImpl(capacity=5.0, leak_rate=1.0)
         for _ in range(5):
             self.assertTrue(lb.request(1.0))
 
     def test_reject_when_full(self):
-        lb = LeakyBucket(capacity=2.0, leak_rate=0.001)
+        lb = LeakyBucketImpl(capacity=2.0, leak_rate=0.001)
         lb.request(1.0)
         lb.request(1.0)
         self.assertFalse(lb.request(1.0))
 
     def test_leak_allows_retry(self):
-        lb = LeakyBucket(capacity=1.0, leak_rate=10.0)
+        lb = LeakyBucketImpl(capacity=1.0, leak_rate=10.0)
         lb.request(1.0)
         time.sleep(0.2)
         self.assertTrue(lb.request(1.0))
 
     def test_serialize_structure(self):
-        lb = LeakyBucket(capacity=100.0, leak_rate=10.0)
+        lb = LeakyBucketImpl(capacity=100.0, leak_rate=10.0)
         s = lb.serialize()
         self.assertIn("level", s)
         self.assertIn("capacity", s)
@@ -174,7 +182,7 @@ class TestLeakyBucket(unittest.TestCase):
         self.assertFalse(s["full"])
 
     def test_serialize_non_mutating(self):
-        lb = LeakyBucket(capacity=1.0, leak_rate=0.001)
+        lb = LeakyBucketImpl(capacity=1.0, leak_rate=0.001)
         lb.request(1.0)
         s1 = lb.serialize()
         s2 = lb.serialize()
@@ -187,6 +195,34 @@ class TestLeakyBucket(unittest.TestCase):
     def test_invalid_leak_rate(self):
         with self.assertRaises(ValueError):
             LeakyBucket(capacity=10.0, leak_rate=0)
+
+    def test_descriptor_as_class_attr(self):
+        class S(AppState):
+            limiter = LeakyBucket(capacity=10.0, leak_rate=1.0)
+
+        s = S()
+        self.assertTrue(s.limiter.request(1.0))
+        d = s.to_dict()
+        self.assertIn("limiter", d)
+        self.assertIn("level", d["limiter"])
+        self.assertIn("capacity", d["limiter"])
+
+    def test_independent_instances(self):
+        class S(AppState):
+            limiter = LeakyBucket(capacity=2.0, leak_rate=0.001)
+
+        s1, s2 = S(), S()
+        s1.limiter.request(2.0)  # fill s1's bucket
+        self.assertFalse(s1.limiter.request(1.0))
+        self.assertTrue(s2.limiter.request(1.0))  # s2 unaffected
+
+    def test_assignment_raises(self):
+        class S(AppState):
+            limiter = LeakyBucket(capacity=10.0, leak_rate=1.0)
+
+        s = S()
+        with self.assertRaises(AttributeError):
+            s.limiter = "oops"
 
 
 class TestAppState(unittest.TestCase):
@@ -218,17 +254,6 @@ class TestAppState(unittest.TestCase):
         s.status = "running"
         d = s.to_dict()
         self.assertEqual(d["status"], "running")
-
-    def test_leaky_bucket_as_instance_attr(self):
-        class S(AppState):
-            pass
-
-        s = S()
-        s.limiter = LeakyBucket(capacity=100, leak_rate=10)
-        d = s.to_dict()
-        self.assertIn("limiter", d)
-        self.assertIn("level", d["limiter"])
-        self.assertIn("capacity", d["limiter"])
 
     def test_callable_interface(self):
         class S(AppState):
@@ -297,7 +322,9 @@ class TestAppState(unittest.TestCase):
         s.rate = 5
         d = s.to_dict()
         for key in d:
-            self.assertFalse(key.startswith("__field_"), f"Found internal key {key!r} in output")
+            self.assertFalse(
+                key.startswith("__field_"), f"Found internal key {key!r} in output"
+            )
 
     def test_ewma_none_before_update(self):
         class S(AppState):
@@ -345,7 +372,7 @@ class TestThreadSafety(unittest.TestCase):
         self.assertEqual(errors, [], f"Thread errors: {errors}")
 
     def test_concurrent_leaky_bucket(self):
-        lb = LeakyBucket(capacity=1000.0, leak_rate=0.001)
+        lb = LeakyBucketImpl(capacity=1000.0, leak_rate=0.001)
         errors: list[Exception] = []
 
         def worker():
@@ -363,6 +390,178 @@ class TestThreadSafety(unittest.TestCase):
             t.join()
 
         self.assertEqual(errors, [], f"Thread errors: {errors}")
+
+
+class TestScalarField(unittest.TestCase):
+    def test_class_attr_in_to_dict_without_assignment(self):
+        class S(AppState):
+            api_calls: int = 0
+            name: str = "default"
+            ratio: float = 1.5
+            active: bool = True
+
+        s = S()
+        d = s.to_dict()
+        self.assertEqual(d["api_calls"], 0)
+        self.assertEqual(d["name"], "default")
+        self.assertAlmostEqual(d["ratio"], 1.5)
+        self.assertEqual(d["active"], True)
+
+    def test_class_attr_updated_via_assignment(self):
+        class S(AppState):
+            count: int = 0
+
+        s = S()
+        s.count = 42
+        self.assertEqual(s.count, 42)
+        self.assertEqual(s.to_dict()["count"], 42)
+
+    def test_class_attr_independent_instances(self):
+        class S(AppState):
+            val: int = 0
+
+        s1, s2 = S(), S()
+        s1.val = 10
+        s2.val = 20
+        self.assertEqual(s1.val, 10)
+        self.assertEqual(s2.val, 20)
+
+    def test_class_attr_not_leaked_to_sibling_class(self):
+        class A(AppState):
+            x: int = 1
+
+        class B(AppState):
+            x: int = 2
+
+        a, b = A(), B()
+        a.x = 99
+        self.assertEqual(a.x, 99)
+        self.assertEqual(b.x, 2)
+
+    def test_scalar_field_descriptor_not_plain_value(self):
+        class S(AppState):
+            count: int = 0
+
+        self.assertIsInstance(S.__dict__["count"], ScalarField)
+
+
+class TestEWMAPreset(unittest.TestCase):
+    def test_preset_returned_before_update(self):
+        impl = EWMAImpl(alpha=0.5, preset=5.0)
+        self.assertAlmostEqual(impl.serialize(), 5.0)
+
+    def test_preset_used_as_initial_value_in_formula(self):
+        impl = EWMAImpl(alpha=0.5, preset=10.0)
+        impl.update(0.0)
+        # 0.5 * 0.0 + 0.5 * 10.0 = 5.0
+        self.assertAlmostEqual(impl.serialize(), 5.0)
+
+    def test_preset_via_descriptor(self):
+        class S(AppState):
+            cpu = EWMA(alpha=0.1, preset=0.0)
+
+        s = S()
+        self.assertAlmostEqual(s.cpu, 0.0)
+
+    def test_no_preset_still_none(self):
+        impl = EWMAImpl(alpha=0.5)
+        self.assertIsNone(impl.serialize())
+
+
+class TestRunningStatsDefaults(unittest.TestCase):
+    def test_min_max_zero_before_update(self):
+        from monsta.fields import RunningStatsImpl
+
+        impl = RunningStatsImpl()
+        result = impl.serialize()
+        self.assertAlmostEqual(result["min"], 0.0)
+        self.assertAlmostEqual(result["max"], 0.0)
+
+    def test_min_max_correct_after_update(self):
+        from monsta.fields import RunningStatsImpl
+
+        impl = RunningStatsImpl()
+        impl.update(3.0)
+        impl.update(7.0)
+        result = impl.serialize()
+        self.assertAlmostEqual(result["min"], 3.0)
+        self.assertAlmostEqual(result["max"], 7.0)
+
+
+class TestAppStateContextManager(unittest.TestCase):
+    def test_context_manager_returns_self(self):
+        class S(AppState):
+            val: int = 0
+
+        s = S()
+        with s as ctx:
+            self.assertIs(ctx, s)
+
+    def test_context_manager_blocks_to_dict(self):
+        """Lock held by context manager should block concurrent to_dict()."""
+
+        class S(AppState):
+            val: int = 0
+
+        s = S()
+        results: list[bool] = []
+
+        def reader():
+            # to_dict() acquires the same RLock; with RLock re-entrancy it will
+            # proceed if called from the same thread.
+            d = s.to_dict()
+            results.append("val" in d)
+
+        with s:
+            s.val = 7
+            # Same thread can still call to_dict() due to RLock
+            d = s.to_dict()
+            self.assertEqual(d["val"], 7)
+
+        # After context exits, other threads can read too
+        t = threading.Thread(target=reader)
+        t.start()
+        t.join()
+        self.assertTrue(all(results))
+
+
+class TestSampledWindow(unittest.TestCase):
+    def test_returns_zero_before_update(self):
+        impl = SampledWindowImpl(window=10.0, zero=0.0)
+        self.assertAlmostEqual(impl.serialize(), 0.0)
+
+    def test_returns_value_after_update(self):
+        impl = SampledWindowImpl(window=10.0, zero=0.0)
+        impl.update(42.0)
+        self.assertAlmostEqual(impl.serialize(), 42.0)
+
+    def test_falls_back_to_zero_after_window(self):
+        impl = SampledWindowImpl(window=0.05, zero=0.0)
+        impl.update(99.0)
+        time.sleep(0.1)
+        self.assertAlmostEqual(impl.serialize(), 0.0)
+
+    def test_custom_zero_value(self):
+        impl = SampledWindowImpl(window=0.05, zero=-1.0)
+        self.assertAlmostEqual(impl.serialize(), -1.0)
+        impl.update(5.0)
+        time.sleep(0.1)
+        self.assertAlmostEqual(impl.serialize(), -1.0)
+
+    def test_descriptor_in_appstate(self):
+        class S(AppState):
+            rate = SampledWindow(window=10.0, zero=0.0)
+
+        s = S()
+        self.assertAlmostEqual(s.rate, 0.0)
+        s.rate = 3.14
+        self.assertAlmostEqual(s.rate, 3.14)
+
+    def test_invalid_window(self):
+        with self.assertRaises(ValueError):
+            SampledWindow(window=0)
+        with self.assertRaises(ValueError):
+            SampledWindow(window=-1)
 
 
 if __name__ == "__main__":

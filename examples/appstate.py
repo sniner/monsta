@@ -35,12 +35,11 @@ class MyAppState(AppState):
     # Running mean / stddev of response latency in milliseconds
     latency = RunningStats()
 
-    def __init__(self):
-        super().__init__()
-        # LeakyBucket is not a descriptor – use it as a plain instance attribute.
-        # AppState.to_dict() detects the .serialize() method automatically.
-        self.rate_limiter = LeakyBucket(capacity=100, leak_rate=10)
-        self.status = "starting"
+    # Token-bucket rate limiter (class attribute – LeakyBucket is a proper descriptor)
+    rate_limiter = LeakyBucket(capacity=100, leak_rate=10)
+
+    # Simple string value – converted to ScalarField automatically
+    status: str = "starting"
 
 
 # ---------------------------------------------------------------------------

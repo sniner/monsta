@@ -1,15 +1,21 @@
 # Monsta - Status Reporting REST API for Python Applications
 
-**Monsta** (short for "Monitoring State") is a lightweight library for Python applications that provides a REST API endpoint for exposing application state and metrics. It's designed for seamless integration with FastAPI.
+**Monsta** (from "to MONitor application STAte") is a lightweight library for
+Python applications that provides a REST API endpoint for exposing application
+state and metrics. It's designed for seamless integration with FastAPI.
 
 ## Features
 
-- **Simple Integration**: Add monitoring to your application with just a few lines of code
+- **Simple Integration**: Add monitoring to your application with just a few
+  lines of code
 - **Async Support**: Native async/await support for FastAPI
 - **Thread-Safe**: Built-in thread safety for concurrent access
-- **Flexible State Management**: Support for both direct state values and callback functions
+- **Flexible State Management**: Support for both direct state values and
+  callback functions
 - **Structured State**: Declarative `AppState` class with built-in metric fields
-- **Built-in Metrics**: Automatic uptime tracking (and possibly other internal metrics)
+- **Atomic Updates**: `with state:` context manager for consistent multi-field
+  updates
+- **Built-in Metrics**: Automatic uptime tracking
 - **Customizable**: Configure endpoint paths, ports, and update intervals
 
 ## Installation
@@ -87,23 +93,23 @@ async def root():
 ## Structured Monitoring State
 
 For applications that need richer, continuously-updated metrics, Monsta provides
-`AppState` – a base class that lets you declare metric fields directly on the class
-using Python descriptors. No manual bookkeeping required.
+`AppState` – a base class that lets you declare metric fields directly on the
+class using Python descriptors. No manual bookkeeping required.
 
 ### Defining State
 
 ```python
-from monsta import AppState, SlidingWindow, EWMA, RunningStats, LeakyBucket, StatusReporter
+from monsta import AppState, SlidingWindow, EWMA, RunningStats, SampledWindow, LeakyBucket
 
 class MyState(AppState):
-    request_rate = SlidingWindow(window=60)   # requests per sliding 60-second window
-    cpu_usage    = EWMA(alpha=0.1)            # exponentially-weighted moving average
-    latency      = RunningStats()             # running mean + stddev (Welford)
+    request_rate = SlidingWindow(window=60)     # requests in the last 60 seconds
+    cpu_usage    = EWMA(alpha=0.1, preset=0.0) # smoothed CPU usage, starts at 0
+    latency      = RunningStats()               # mean, stddev, min, max
+    active_rps   = SampledWindow(window=5.0)   # decays to 0 if not updated for 5 s
+    rate_limiter = LeakyBucket(capacity=100, leak_rate=10)
 
-    def __init__(self):
-        super().__init__()
-        self.rate_limiter = LeakyBucket(capacity=100, leak_rate=10)  # instance attr
-        self.status = "starting"
+    api_calls: int = 0
+    status: str = "starting"
 ```
 
 ### Using State
@@ -112,19 +118,18 @@ class MyState(AppState):
 state = MyState()
 
 mon = StatusReporter()
-mon.publish(state)   # AppState is callable → treated as a state callback
+mon.publish(state)
 
-# Update metrics via normal assignment (routed to the field implementation):
-state.request_rate = 1       # adds 1 hit to the sliding window
-state.cpu_usage    = 73.5    # feeds a new EWMA sample
-state.latency      = 42      # adds a latency data point
+state.request_rate = 1       # count one request
+state.cpu_usage    = 73.5    # current CPU %
+state.latency      = 42      # latency in ms
+state.active_rps   = 120     # holds 120 for 5 s, then decays to 0
 
-# Rate limiter is used directly:
+state.api_calls += 1
+state.status = "degraded"
+
 if not state.rate_limiter.request():
     raise Exception("Rate limit exceeded")
-
-# Plain attributes serialize as-is:
-state.status = "degraded"
 ```
 
 `GET /mon/v1/state` will then return:
@@ -135,11 +140,25 @@ state.status = "degraded"
   "state": {
     "request_rate": 15.3,
     "cpu_usage": 32.5,
-    "latency": {"n": 100, "mean": 45.2, "stddev": 8.1},
-    "rate_limiter": {"level": 45.0, "capacity": 100, "full": false},
-    "status": "degraded"
+    "latency": {"n": 100, "mean": 45.2, "stddev": 8.1, "min": 10.0, "max": 120.0},
+    "active_rps": 120.0,
+    "api_calls": 1,
+    "status": "degraded",
+    "rate_limiter": {"level": 45.0, "capacity": 100, "full": false}
   }
 }
+```
+
+### Atomic Updates
+
+Use `AppState` as a context manager to guarantee that no partial state is read
+while you are updating multiple fields:
+
+```python
+with state:
+    state.api_calls += 1
+    state.status = "degraded"
+    state.cpu_usage = 95.0
 ```
 
 ### Field Reference
@@ -147,29 +166,39 @@ state.status = "degraded"
 | Field | Constructor | Assignment | Serialized as |
 |---|---|---|---|
 | `SlidingWindow` | `SlidingWindow(window=60.0)` | Counts `value` hits | `float` – rate over the window |
-| `EWMA` | `EWMA(alpha=0.1)` | Feeds a new sample | `float \| None` – current estimate |
-| `RunningStats` | `RunningStats()` | Adds a data point | `{"n", "mean", "stddev"}` |
+| `EWMA` | `EWMA(alpha=0.1, preset=None)` | Feeds a new sample | `float \| None` – current estimate |
+| `RunningStats` | `RunningStats()` | Adds a data point | `{"n", "mean", "stddev", "min", "max"}` |
+| `SampledWindow` | `SampledWindow(window=60.0, zero=0.0)` | Stores value + timestamp | `float` – value or `zero` after window |
 | `LeakyBucket` | `LeakyBucket(capacity, leak_rate)` | n/a – use `.request()` | `{"level", "capacity", "full"}` |
 
-**`SlidingWindow(window)`** – interpolated two-bucket counter. Tracks how many hits
-occurred in the last `window` seconds. Thread-safe.
+**`SlidingWindow(window)`** – rate counter. Returns how many hits accumulated in
+the last `window` seconds, with smooth interpolation at window boundaries.
 
-**`EWMA(alpha)`** – exponentially weighted moving average. `alpha` ∈ `(0, 1]` controls
-smoothing: values near `0` are very smooth, `1` means no smoothing. Returns `None`
-until the first sample arrives.
+**`EWMA(alpha, *, preset=None)`** – exponentially weighted moving average.
+`alpha` ∈ `(0, 1]` controls smoothing: values near `0` are very smooth, `1`
+means no smoothing. Returns `None` until the first sample arrives, unless
+`preset` seeds an initial value.
 
-**`RunningStats()`** – online mean and standard deviation via Welford's algorithm.
-Never stores raw data, so it is constant in memory regardless of sample count.
+**`RunningStats()`** – tracks mean, standard deviation, min, and max over all
+samples seen. Constant memory regardless of sample count. `min` and `max` are
+`0.0` before the first sample.
 
-**`LeakyBucket(capacity, leak_rate)`** – token-bucket rate limiter. The bucket drains
-at `leak_rate` tokens/second. Call `.request(amount=1.0)` to consume tokens; returns
-`True` if allowed, `False` if the bucket would overflow. Use as a plain instance
-attribute in `AppState.__init__`.
+**`SampledWindow(window, zero=0.0)`** – holds the last assigned value for
+`window` seconds, then returns `zero`. Useful for rates or signals that should
+decay to zero when no update arrives (e.g. requests-per-second sampled from a
+counter).
+
+**`LeakyBucket(capacity, leak_rate)`** – token-bucket rate limiter. The bucket
+drains at `leak_rate` tokens/second. Declare as a class attribute like any other
+field. Accessing the attribute returns the bucket object; call
+`.request(amount=1.0)` to consume tokens – returns `True` if allowed, `False` if
+the bucket would overflow. Assignment raises `AttributeError`.
 
 ### Inheritance
 
-Child classes inherit all parent fields. A child field with the same name shadows the
-parent's field. Each `AppState` instance maintains its own independent field state.
+Child classes inherit all parent fields. A child field with the same name
+shadows the parent's field. Each `AppState` instance maintains its own
+independent field state.
 
 ```python
 class BaseState(AppState):
@@ -188,15 +217,17 @@ class ExtendedState(BaseState):
 
 The main synchronous status reporter class.
 
-#### `StatusReporter(endpoint: Optional[str] = None)`
+#### `StatusReporter(endpoint: Optional[str] = None, update_holdoff: float = 5)`
 
-- `endpoint`: Custom endpoint path for the status API (default: `/mon/v1/state`)
+- `endpoint`: Custom endpoint path (default: `/mon/v1/state`)
+- `update_holdoff`: Minimum seconds between state refreshes (default: `5`)
 
 #### `publish(state: StateSource) -> Self`
 
 Set the application state.
 
-- `state`: Either a callable that returns state data, or a mapping/dictionary containing the state data directly
+- `state`: Either a callable that returns state data, or a mapping/dictionary
+  containing the state data directly
 
 Returns `self` for method chaining.
 
@@ -212,15 +243,16 @@ def get_current_state():
 reporter.publish(get_current_state)
 ```
 
-#### `start(*, state: Optional[StateSource] = None, host: Optional[str] = None, port: Optional[int] = None, log_level: Optional[Union[int, str]] = None, blocking: bool = False) -> None`
+#### `start(*, state=None, host=None, port=None, log_level=None, blocking=False, update_holdoff=None) -> None`
 
 Start the status reporter.
 
-- `state`: Initial state or callable to get initial state
-- `host`: Host address to bind to (default: `"0.0.0.0"`)
-- `port`: Port number to listen on (default: `4242`)
-- `log_level`: Logging level for uvicorn
-- `blocking`: If True, blocks until server stops (default: `False`)
+- `state`: Initial state or callable returning state
+- `host`: Bind address (default: `"0.0.0.0"`)
+- `port`: Port (default: `4242`)
+- `log_level`: Logging level passed to uvicorn
+- `blocking`: If `True`, blocks until the server stops
+- `update_holdoff`: Overrides the constructor value for this run
 
 #### `stop() -> None`
 
@@ -228,7 +260,7 @@ Stop the status reporter and clean up resources.
 
 #### `reset() -> None`
 
-Reset the status reporter to its initial state.
+Reset state and timers. Does not stop a running server.
 
 ### AsyncStatusReporter
 
@@ -242,7 +274,8 @@ Async version of StatusReporter for use with FastAPI and other async frameworks.
 
 Set the application state asynchronously.
 
-- `state`: Either a callable that returns state data (can be async), or a mapping/dictionary containing the state data directly
+- `state`: Either a callable that returns state data (can be async), or a
+  mapping/dictionary containing the state data directly
 
 **Examples:**
 ```python
@@ -267,7 +300,8 @@ Start the async status reporter.
 - `state`: Initial state or callable to get initial state
 - `host`: Host address to bind to (default: `"0.0.0.0"`)
 - `port`: Port number to listen on (default: `4242`)
-- `update_interval`: Interval in seconds for automatic state updates (default: `5`)
+- `update_interval`: Interval in seconds for automatic state updates (default:
+  `5`)
 
 #### `async stop() -> None`
 
@@ -306,13 +340,16 @@ You can customize the monitoring behavior:
 
 ```python
 # Custom endpoint
-mon = MonitoringAgent(endpoint="/custom/monitoring/path")
+mon = StatusReporter(endpoint="/custom/monitoring/path")
 
 # Custom host and port
 mon.start(host="127.0.0.1", port=8080)
 
+# Custom update holdoff (rate-limit for automatic state refreshes)
+mon.start(update_holdoff=10.0)  # refresh at most every 10 seconds
+
 # Custom update interval (async only)
-await async_mon.start(update_interval=10)  # Update every 10 seconds
+await async_mon.start(update_interval=10)  # update every 10 seconds
 ```
 
 ## Monitoring Endpoint
@@ -343,7 +380,8 @@ See the `examples/` directory for complete working examples:
 - `embedded_async.py`: Async FastAPI integration
 - `singleton.py`: Singleton usage example
 - `standalone.py`: Standalone monitoring server
-- `appstate.py`: Structured state with `AppState`, `SlidingWindow`, `EWMA`, `RunningStats`, and `LeakyBucket`
+- `appstate.py`: Structured state with `AppState`, `SlidingWindow`, `EWMA`,
+  `RunningStats`, `SampledWindow`, and `LeakyBucket`
 
 ## License
 
@@ -351,4 +389,5 @@ See the `examples/` directory for complete working examples:
 
 ## Support
 
-For issues, questions, or contributions, please open an issue on the GitHub repository.
+For issues, questions, or contributions, please open an issue on the GitHub
+repository.
