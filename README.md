@@ -1,5 +1,19 @@
 # Monsta - Status Reporting REST API for Python Applications
 
+> [!WARNING]
+> **monsta 0.2.0 contains breaking changes.** The descriptor-based field
+> model from 0.1.x has been replaced with instance-attribute fields, and
+> field assignment semantics changed. Existing
+> `class MyState(AppState): hits = SlidingWindow(...)` declarations now
+> raise a clear `TypeError` at class definition time. The full migration
+> guide lives in [CHANGELOG.md](./CHANGELOG.md). In a nutshell:
+>
+> - Declare fields in `__init__`, not at class scope.
+> - Counters: `state.hits.inc()` or `state.hits += 1` (now genuinely atomic).
+> - Samplers: `state.cpu.update(73.5)`.
+> - Holders: `state.active_rps.set(120)`.
+> - `ScalarField` is gone — use plain instance attributes.
+
 **Monsta** (from "to MONitor application STAte") is a lightweight library for
 Python applications that provides a REST API endpoint for exposing application
 state and metrics. It's designed for seamless integration with FastAPI.
@@ -93,27 +107,34 @@ async def root():
 ## Structured Monitoring State
 
 For applications that need richer, continuously-updated metrics, Monsta provides
-`AppState` – a base class that lets you declare metric fields directly on the
-class using Python descriptors. No manual bookkeeping required.
+`AppState` – a base class that lets you declare metric fields as instance
+attributes inside `__init__`. Each field is a regular Python object with
+explicit methods (`inc`, `set`, `update`, `request`, `reset`) and its own
+internal lock. Plain instance attributes work side by side and are passed
+through to `to_dict()` as-is.
 
 ### Defining State
 
 ```python
 from monsta import (
     AppState, SlidingWindow, PeriodicSum, EWMA,
-    RunningStats, SampledWindow, LeakyBucket,
+    RunningStats, SlidingPercentiles, SampledWindow, LeakyBucket,
 )
 
 class MyState(AppState):
-    request_rate = SlidingWindow(window=60)     # requests in the last 60 seconds
-    jobs_today   = PeriodicSum()                # counter that resets at midnight
-    cpu_usage    = EWMA(alpha=0.1, preset=0.0) # smoothed CPU usage, starts at 0
-    latency      = RunningStats()               # mean, stddev, min, max
-    active_rps   = SampledWindow(window=5.0)   # decays to 0 if not updated for 5 s
-    rate_limiter = LeakyBucket(capacity=100, leak_rate=10)
+    def __init__(self) -> None:
+        super().__init__()
+        self.request_rate = SlidingWindow(window=60)     # requests in the last 60 seconds
+        self.jobs_today   = PeriodicSum()                # counter that resets at midnight
+        self.cpu_usage    = EWMA(alpha=0.1, preset=0.0)  # smoothed CPU usage, starts at 0
+        self.latency      = RunningStats()               # mean, stddev, min, max
+        self.db_latency   = SlidingPercentiles(window=600.0)  # p50/p90/p95/p99 over 10 min
+        self.active_rps   = SampledWindow(window=5.0)    # decays to 0 if not updated for 5 s
+        self.rate_limiter = LeakyBucket(capacity=100, leak_rate=10)
 
-    api_calls: int = 0
-    status: str = "starting"
+        # Plain instance attributes are fine — they show up in to_dict() too.
+        self.api_calls: int = 0
+        self.status: str = "starting"
 ```
 
 ### Using State
@@ -124,18 +145,32 @@ state = MyState()
 mon = StatusReporter()
 mon.publish(state)
 
-state.request_rate += 1     # count one request
-state.jobs_today   += 1     # one more job done today
-state.cpu_usage    = 73.5    # current CPU %
-state.latency      = 42      # latency in ms
-state.active_rps   = 120     # holds 120 for 5 s, then decays to 0
+# Counters: atomic increments, either method or operator form
+state.request_rate += 1            # one more request (atomic)
+state.request_rate.inc()           # equivalent
+state.jobs_today += 1              # one more job done today (atomic)
 
+# Samplers: feed observations
+state.cpu_usage.update(73.5)       # current CPU %
+state.latency.update(42)           # one latency sample, in ms
+state.db_latency.update(query_ms)  # one DB query timing, summarised as quantiles
+
+# Holders: store the latest value with a TTL
+state.active_rps.set(120)          # holds 120 for 5 s, then decays to 0
+
+# Plain attributes
 state.api_calls += 1
 state.status = "degraded"
 
+# Rate limiter: consume tokens explicitly
 if not state.rate_limiter.request():
     raise Exception("Rate limit exceeded")
 ```
+
+Trying to overwrite a Field with a non-Field value (e.g. `state.request_rate = 0`)
+raises a `TypeError` with a hint pointing at `set()` / `reset()` / `+=`. The
+guard catches the most common 0.1.x footgun where assignment silently meant
+"increment" or "feed sample" depending on the field type.
 
 `GET /mon/v1/state` will then return:
 
@@ -164,66 +199,100 @@ while you are updating multiple fields:
 with state:
     state.api_calls += 1
     state.status = "degraded"
-    state.cpu_usage = 95.0
+    state.cpu_usage.update(95.0)
 ```
+
+The lock is reentrant, so you can call `state.to_dict()` from inside a
+`with state:` block without deadlocking.
 
 ### Field Reference
 
-| Field | Constructor | Assignment | Serialized as |
+| Field | Constructor | Methods | Serialized as |
 |---|---|---|---|
-| `SlidingWindow` | `SlidingWindow(window=60.0)` | `+= n` to record hits, `=` to overwrite | `float` – rate over the window |
-| `PeriodicSum` | `PeriodicSum(reset_at=time(0,0), tz=None)` | `+= n` to record hits, `=` to overwrite | `float` – count since last reset |
-| `EWMA` | `EWMA(alpha=0.1, preset=None)` | Feeds a new sample | `float \| None` – current estimate |
-| `RunningStats` | `RunningStats()` | Adds a data point | `{"n", "mean", "stddev", "min", "max"}` |
-| `SampledWindow` | `SampledWindow(window=60.0, zero=0.0)` | Stores value + timestamp | `float` – value or `zero` after window |
-| `LeakyBucket` | `LeakyBucket(capacity, leak_rate)` | n/a – use `.request()` | `{"level", "capacity", "full"}` |
+| `SlidingWindow` | `SlidingWindow(window=60.0)` | `inc`, `set`, `reset`, `+=` | `float` – rate over the window |
+| `PeriodicSum` | `PeriodicSum(reset_at=time(0,0), tz=None)` | `inc`, `set`, `reset`, `+=` | `float` – count since last reset |
+| `EWMA` | `EWMA(alpha=0.1, preset=None)` | `update`, `reset` | `float \| None` – current estimate |
+| `RunningStats` | `RunningStats()` | `update`, `reset` | `{"n", "mean", "stddev", "min", "max"}` |
+| `SlidingPercentiles` | `SlidingPercentiles(window=600.0, quantiles=(50,90,95,99), max_samples=10_000)` | `update`, `reset` | `{"n", "p50", …, "min", "max"}` |
+| `SampledWindow` | `SampledWindow(window=60.0, zero=0.0)` | `set`, `reset` | `float` – value or `zero` after window |
+| `LeakyBucket` | `LeakyBucket(capacity, leak_rate)` | `request`, `reset` | `{"level", "capacity", "full"}` |
 
-**`SlidingWindow(window)`** – rate counter. Returns how many hits accumulated in
-the last `window` seconds, with smooth interpolation at window boundaries. Use
-`state.x += n` to record events; `state.x = 0` resets the current bucket. Note
-that `+=` is not atomic across threads — for multi-writer counters, serialize
-the increment yourself.
+Method semantics are uniform across fields: `inc` increments a counter,
+`set` overwrites a stored value, `update` feeds an observation to a sampler,
+`request` consumes tokens, `reset` returns the field to its initial state.
+There is no method that means "increment on counters but feed sample on
+samplers" – that ambiguity was a 0.1.x footgun and is gone.
+
+**`SlidingWindow(window)`** – rate counter. Returns how many hits accumulated
+in the last `window` seconds, with smooth interpolation at window boundaries.
+Use `state.x.inc()` (or `state.x += n`) to record events; both forms are
+atomic across threads. `state.x.set(value)` overwrites the current bucket
+(useful for syncing to an external counter). `state.x.reset()` clears both
+buckets.
 
 **`PeriodicSum(reset_at=time(0,0), tz=None)`** – calendar-aligned counter that
 accumulates events and snaps back to zero at a configurable wall-clock time
 each day (default local midnight). Useful for "events today", "requests since
 midnight". Pass a `ZoneInfo` to pin the reset to a specific timezone. Same
-threading caveat as `SlidingWindow`.
+atomic `inc`/`+=` semantics as `SlidingWindow`.
 
 **`EWMA(alpha, *, preset=None)`** – exponentially weighted moving average.
 `alpha` ∈ `(0, 1]` controls smoothing: values near `0` are very smooth, `1`
-means no smoothing. Returns `None` until the first sample arrives, unless
-`preset` seeds an initial value.
+means no smoothing. Feed samples with `state.x.update(sample)`. Returns
+`None` until the first sample arrives, unless `preset` seeds an initial
+value. `state.x.reset()` returns to `preset` (or `None`).
 
 **`RunningStats()`** – tracks mean, standard deviation, min, and max over all
-samples seen. Constant memory regardless of sample count. `min` and `max` are
-`0.0` before the first sample.
+samples seen. Constant memory regardless of sample count. Feed samples with
+`state.x.update(sample)`. `min` and `max` are reported as `0.0` before the
+first sample.
+
+**`SlidingPercentiles(window, *, quantiles=(50, 90, 95, 99), max_samples=10_000)`**
+– tracks quantiles over a sliding time window. Useful for latencies and other
+heavy-tailed signals where mean and standard deviation are misleading
+(database query times are the canonical case). Holds individual samples for
+the last `window` seconds and computes quantiles on demand using linear
+interpolation, matching `numpy.percentile` defaults. The serialized output
+uses `f"p{q:g}"` as keys, so `p50`, `p99`, `p99.9` all work. `max_samples`
+caps memory; once reached, the oldest sample is dropped (so under sustained
+high throughput the effective window may shrink — pick the cap accordingly).
+Feed samples with `state.x.update(sample)`. Before the first sample, `n` is
+`0` and all quantiles report `0.0` (no nulls — easier to chart).
 
 **`SampledWindow(window, zero=0.0)`** – holds the last assigned value for
-`window` seconds, then returns `zero`. Useful for rates or signals that should
-decay to zero when no update arrives (e.g. requests-per-second sampled from a
-counter).
+`window` seconds, then returns `zero`. Useful for rates or signals that
+should decay to zero when no fresh update arrives (e.g. requests-per-second
+sampled from a counter). Use `state.x.set(value)` to store a new sample.
 
-**`LeakyBucket(capacity, leak_rate)`** – token-bucket rate limiter. The bucket
-drains at `leak_rate` tokens/second. Declare as a class attribute like any other
-field. Accessing the attribute returns the bucket object; call
-`.request(amount=1.0)` to consume tokens – returns `True` if allowed, `False` if
-the bucket would overflow. Assignment raises `AttributeError`.
+**`LeakyBucket(capacity, leak_rate)`** – token-bucket rate limiter. The
+bucket drains at `leak_rate` tokens/second. Call
+`state.x.request(amount=1.0)` to consume tokens – returns `True` if allowed,
+`False` if the bucket would overflow. Direct assignment is rejected by the
+`AppState` setattr guard with a clear error message.
 
 ### Inheritance
 
-Child classes inherit all parent fields. A child field with the same name
-shadows the parent's field. Each `AppState` instance maintains its own
-independent field state.
+Child classes inherit all parent fields by calling `super().__init__()`. A
+child can override a parent's field with a different `Field` instance — even
+of a different type — by reassigning it in its own `__init__`. The setattr
+guard explicitly allows Field-to-Field replacement.
 
 ```python
 class BaseState(AppState):
-    cpu = EWMA(alpha=0.1)
+    def __init__(self) -> None:
+        super().__init__()
+        self.cpu = EWMA(alpha=0.1)
 
 class ExtendedState(BaseState):
-    cpu     = RunningStats()   # overrides BaseState.cpu for this class
-    memory  = EWMA(alpha=0.2)
+    def __init__(self) -> None:
+        super().__init__()
+        self.cpu = RunningStats()       # overrides BaseState.cpu
+        self.memory = EWMA(alpha=0.2)
 ```
+
+Note that any data the parent already wrote to the original field is lost
+when the child rebinds it. Each `AppState` instance otherwise keeps its own
+independent field state.
 
 ---
 

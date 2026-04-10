@@ -1,11 +1,13 @@
 __all__ = [
-    "AsyncStatusReporter",
     "AppState",
+    "AsyncStatusReporter",
     "EWMA",
+    "Field",
     "LeakyBucket",
     "PeriodicSum",
     "RunningStats",
     "SampledWindow",
+    "SlidingPercentiles",
     "SlidingWindow",
     "StatusReporter",
     "publish",
@@ -15,6 +17,15 @@ __all__ = [
 ]
 
 from .aiomon import AsyncStatusReporter
-from .fields import EWMA, LeakyBucket, PeriodicSum, RunningStats, SampledWindow, SlidingWindow
+from .fields import (
+    EWMA,
+    Field,
+    LeakyBucket,
+    PeriodicSum,
+    RunningStats,
+    SampledWindow,
+    SlidingPercentiles,
+    SlidingWindow,
+)
 from .mon import StatusReporter, publish, reset, start, stop
 from .state import AppState

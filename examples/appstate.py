@@ -1,10 +1,13 @@
 """
 Example showing how to use AppState for structured monitoring.
 
-AppState lets you declare metrics as class attributes using descriptor fields
-(SlidingWindow, EWMA, RunningStats) and plain instance attributes side by side.
-Because AppState.__call__() returns to_dict(), it integrates transparently with
-mon.publish() / AsyncStatusReporter.publish() as a state callback.
+AppState lets you declare metric fields as instance attributes inside
+__init__() and update them via explicit methods (inc / set / update /
+request) or atomic ``+=`` on counter fields. Plain attributes work too.
+
+Because AppState.__call__() returns to_dict(), an AppState instance
+plugs straight into mon.publish() / AsyncStatusReporter.publish() as a
+state callback.
 
 Run:
     uv run python examples/appstate.py
@@ -26,20 +29,23 @@ from monsta import EWMA, AppState, LeakyBucket, RunningStats, SlidingWindow, Sta
 
 
 class MyAppState(AppState):
-    # Requests per minute (sliding-window counter)
-    request_rate = SlidingWindow(window=60.0)
+    def __init__(self) -> None:
+        super().__init__()
 
-    # Exponentially-weighted moving average of CPU usage (0–100 %)
-    cpu_usage = EWMA(alpha=0.1)
+        # Requests per minute (sliding-window counter)
+        self.request_rate = SlidingWindow(window=60.0)
 
-    # Running mean / stddev of response latency in milliseconds
-    latency = RunningStats()
+        # Exponentially-weighted moving average of CPU usage (0–100 %)
+        self.cpu_usage = EWMA(alpha=0.1)
 
-    # Token-bucket rate limiter (class attribute – LeakyBucket is a proper descriptor)
-    rate_limiter = LeakyBucket(capacity=100, leak_rate=10)
+        # Running mean / stddev of response latency in milliseconds
+        self.latency = RunningStats()
 
-    # Simple string value – converted to ScalarField automatically
-    status: str = "starting"
+        # Token-bucket rate limiter
+        self.rate_limiter = LeakyBucket(capacity=100, leak_rate=10)
+
+        # Plain instance attribute — passed through to to_dict() as-is
+        self.status: str = "starting"
 
 
 # ---------------------------------------------------------------------------
@@ -75,11 +81,11 @@ def root():
 
     elapsed_ms = (time.monotonic() - t0) * 1000
 
-    # Update metrics – the descriptor __set__ routes values to the right impl
-    state.request_rate += 1  # count one hit in the sliding window
-    state.cpu_usage = 20.0  # fake CPU reading
-    state.latency = elapsed_ms  # add a latency sample
-    state.status = "running"
+    # Update metrics — explicit method per field type
+    state.request_rate += 1            # atomic counter increment
+    state.cpu_usage.update(20.0)       # feed one EWMA sample
+    state.latency.update(elapsed_ms)   # add a latency observation
+    state.status = "running"           # plain attribute
 
     return {"message": "Hello World", "latency_ms": round(elapsed_ms, 2)}
 
@@ -93,7 +99,7 @@ def _cpu_poller():
     import random
 
     while True:
-        state.cpu_usage = random.uniform(10, 80)
+        state.cpu_usage.update(random.uniform(10, 80))
         time.sleep(2)
 
 
