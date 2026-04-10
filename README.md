@@ -99,10 +99,14 @@ class using Python descriptors. No manual bookkeeping required.
 ### Defining State
 
 ```python
-from monsta import AppState, SlidingWindow, EWMA, RunningStats, SampledWindow, LeakyBucket
+from monsta import (
+    AppState, SlidingWindow, PeriodicSum, EWMA,
+    RunningStats, SampledWindow, LeakyBucket,
+)
 
 class MyState(AppState):
     request_rate = SlidingWindow(window=60)     # requests in the last 60 seconds
+    jobs_today   = PeriodicSum()                # counter that resets at midnight
     cpu_usage    = EWMA(alpha=0.1, preset=0.0) # smoothed CPU usage, starts at 0
     latency      = RunningStats()               # mean, stddev, min, max
     active_rps   = SampledWindow(window=5.0)   # decays to 0 if not updated for 5 s
@@ -120,7 +124,8 @@ state = MyState()
 mon = StatusReporter()
 mon.publish(state)
 
-state.request_rate = 1       # count one request
+state.request_rate += 1     # count one request
+state.jobs_today   += 1     # one more job done today
 state.cpu_usage    = 73.5    # current CPU %
 state.latency      = 42      # latency in ms
 state.active_rps   = 120     # holds 120 for 5 s, then decays to 0
@@ -139,6 +144,7 @@ if not state.rate_limiter.request():
   "internal": {"uptime": 42},
   "state": {
     "request_rate": 15.3,
+    "jobs_today": 248.0,
     "cpu_usage": 32.5,
     "latency": {"n": 100, "mean": 45.2, "stddev": 8.1, "min": 10.0, "max": 120.0},
     "active_rps": 120.0,
@@ -165,14 +171,24 @@ with state:
 
 | Field | Constructor | Assignment | Serialized as |
 |---|---|---|---|
-| `SlidingWindow` | `SlidingWindow(window=60.0)` | Counts `value` hits | `float` – rate over the window |
+| `SlidingWindow` | `SlidingWindow(window=60.0)` | `+= n` to record hits, `=` to overwrite | `float` – rate over the window |
+| `PeriodicSum` | `PeriodicSum(reset_at=time(0,0), tz=None)` | `+= n` to record hits, `=` to overwrite | `float` – count since last reset |
 | `EWMA` | `EWMA(alpha=0.1, preset=None)` | Feeds a new sample | `float \| None` – current estimate |
 | `RunningStats` | `RunningStats()` | Adds a data point | `{"n", "mean", "stddev", "min", "max"}` |
 | `SampledWindow` | `SampledWindow(window=60.0, zero=0.0)` | Stores value + timestamp | `float` – value or `zero` after window |
 | `LeakyBucket` | `LeakyBucket(capacity, leak_rate)` | n/a – use `.request()` | `{"level", "capacity", "full"}` |
 
 **`SlidingWindow(window)`** – rate counter. Returns how many hits accumulated in
-the last `window` seconds, with smooth interpolation at window boundaries.
+the last `window` seconds, with smooth interpolation at window boundaries. Use
+`state.x += n` to record events; `state.x = 0` resets the current bucket. Note
+that `+=` is not atomic across threads — for multi-writer counters, serialize
+the increment yourself.
+
+**`PeriodicSum(reset_at=time(0,0), tz=None)`** – calendar-aligned counter that
+accumulates events and snaps back to zero at a configurable wall-clock time
+each day (default local midnight). Useful for "events today", "requests since
+midnight". Pass a `ZoneInfo` to pin the reset to a specific timezone. Same
+threading caveat as `SlidingWindow`.
 
 **`EWMA(alpha, *, preset=None)`** – exponentially weighted moving average.
 `alpha` ∈ `(0, 1]` controls smoothing: values near `0` are very smooth, `1`

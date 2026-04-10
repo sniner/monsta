@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import math
 import threading
 import time
@@ -84,7 +85,7 @@ class SlidingWindowImpl(FieldImpl):
         with self.lock:
             now = time.monotonic()
             self._sync(now)
-            self.curr += float(value)
+            self.curr = float(value)
 
     def serialize(self) -> float:
         with self.lock:
@@ -95,6 +96,26 @@ class SlidingWindowImpl(FieldImpl):
 
 
 class SlidingWindow(StateField):
+    """Counter that averages a sliding interval, useful for rates.
+
+    Use ``+=`` to record events; plain assignment overwrites the current
+    bucket (useful for resetting to zero).
+
+    Example:
+        class S(AppState):
+            request_rate = SlidingWindow(window=60.0)
+
+        state.request_rate += 1   # one more hit
+        state.request_rate = 0    # reset current bucket
+
+    Threading note: ``+=`` is *not* atomic across threads. Python's
+    descriptor protocol expands ``state.x += 1`` into a get/add/set
+    sequence and the field's lock can only protect each step
+    individually, so concurrent writers may lose updates. For
+    single-writer scenarios this is fine; for multi-writer counters,
+    serialize the increment yourself.
+    """
+
     def __init__(self, window: float = 60.0) -> None:
         if window <= 0:
             raise ValueError(f"window must be positive, got {window}")
@@ -204,6 +225,96 @@ class SampledWindow(StateField):
 
     def _make_impl(self) -> SampledWindowImpl:
         return SampledWindowImpl(self._window, zero=self._zero)
+
+
+class PeriodicSumImpl(FieldImpl):
+    def __init__(self, reset_at: datetime.time, tz: datetime.tzinfo | None) -> None:
+        self.reset_at = reset_at
+        self.tz = tz
+        self._value: float = 0.0
+        self.lock = threading.Lock()
+        self._period_start: datetime.datetime = self._period_start_for(self._now())
+
+    def _now(self) -> datetime.datetime:
+        return datetime.datetime.now(self.tz)
+
+    def _period_start_for(self, now: datetime.datetime) -> datetime.datetime:
+        today_reset = now.replace(
+            hour=self.reset_at.hour,
+            minute=self.reset_at.minute,
+            second=self.reset_at.second,
+            microsecond=self.reset_at.microsecond,
+        )
+        if now < today_reset:
+            return today_reset - datetime.timedelta(days=1)
+        return today_reset
+
+    def _sync(self, now: datetime.datetime) -> None:
+        start = self._period_start_for(now)
+        if start > self._period_start:
+            self._value = 0.0
+            self._period_start = start
+
+    def update(self, value: float | int) -> None:
+        with self.lock:
+            self._sync(self._now())
+            self._value = float(value)
+
+    def serialize(self) -> float:
+        with self.lock:
+            self._sync(self._now())
+            return self._value
+
+
+class PeriodicSum(StateField):
+    """Accumulating counter that resets at a fixed wall-clock time each day.
+
+    Unlike SlidingWindow (which averages a sliding interval), PeriodicSum
+    accumulates values until a configurable time of day (default midnight)
+    and then snaps back to zero. Useful for "events today", "requests since
+    midnight" and similar calendar-aligned counters.
+
+    Use ``+=`` to record events; plain assignment overwrites the current
+    counter (useful for resetting to zero or syncing to an external value):
+
+        state.jobs_today += 1   # adds 1 to today's total
+        state.jobs_today = 0    # explicit reset
+
+    Threading note: ``+=`` is *not* atomic across threads (see
+    SlidingWindow for the underlying reason). Use single-writer or
+    serialize increments yourself when multiple threads write.
+
+    Note: ``reset_at`` is interpreted in the configured timezone (or local
+    naive time if ``tz`` is None). Reset times that fall inside a DST gap
+    or repeated hour may shift slightly on transition days; for the typical
+    midnight default this is a non-issue.
+
+    Example:
+        from datetime import time
+        from zoneinfo import ZoneInfo
+
+        class S(AppState):
+            jobs_today = PeriodicSum()  # reset at local midnight
+            requests_today = PeriodicSum(
+                reset_at=time(6, 0),
+                tz=ZoneInfo("Europe/Berlin"),
+            )
+    """
+
+    def __init__(
+        self,
+        reset_at: datetime.time = datetime.time(0, 0),
+        tz: datetime.tzinfo | None = None,
+    ) -> None:
+        if not isinstance(reset_at, datetime.time):
+            raise TypeError(
+                f"reset_at must be a datetime.time, got {type(reset_at).__name__}"
+            )
+        self._reset_at = reset_at
+        self._tz = tz
+
+    def _make_impl(self) -> PeriodicSumImpl:
+        return PeriodicSumImpl(self._reset_at, self._tz)
 
 
 class LeakyBucketImpl(FieldImpl):

@@ -4,15 +4,18 @@ Unit tests for AppState, SlidingWindow, EWMA, RunningStats, and LeakyBucket.
 
 from __future__ import annotations
 
+import datetime
 import json
 import threading
 import time
 import unittest
+from zoneinfo import ZoneInfo
 
 from monsta import (
     EWMA,
     AppState,
     LeakyBucket,
+    PeriodicSum,
     RunningStats,
     SampledWindow,
     SlidingWindow,
@@ -20,6 +23,7 @@ from monsta import (
 from monsta.fields import (
     EWMAImpl,
     LeakyBucketImpl,
+    PeriodicSumImpl,
     RunningStatsImpl,
     SampledWindowImpl,
     ScalarField,
@@ -35,19 +39,16 @@ class TestSlidingWindow(unittest.TestCase):
         impl = self._make_impl()
         self.assertEqual(impl.serialize(), 0.0)
 
-    def test_hit_accumulates(self):
+    def test_single_update_visible(self):
         impl = self._make_impl(window=10.0)
         impl.update(1)
-        impl.update(1)
-        impl.update(1)
-        rate = impl.serialize()
-        self.assertGreater(rate, 0.0)
+        self.assertGreater(impl.serialize(), 0.0)
 
     def test_amount_greater_than_one(self):
         impl = self._make_impl(window=10.0)
         impl.update(5)
-        rate = impl.serialize()
-        self.assertGreater(rate, 0.0)
+        self.assertAlmostEqual(impl.curr, 5.0)
+        self.assertGreater(impl.serialize(), 0.0)
 
     def test_window_expiry(self):
         """After more than two window-lengths the rate should be 0."""
@@ -69,8 +70,26 @@ class TestSlidingWindow(unittest.TestCase):
 
         s = S()
         self.assertEqual(s.rate, 0.0)
-        s.rate = 3
+        s.rate += 3
         self.assertGreater(s.rate, 0.0)
+
+    def test_assignment_overwrites_bucket(self):
+        impl = self._make_impl(window=10.0)
+        impl.update(5)
+        impl.update(2)
+        # Each update overwrites the current bucket (absolute set semantics).
+        self.assertAlmostEqual(impl.curr, 2.0)
+
+    def test_iadd_via_descriptor_accumulates(self):
+        class S(AppState):
+            rate = SlidingWindow(window=60.0)
+
+        s = S()
+        s.rate += 1
+        s.rate += 1
+        s.rate += 1
+        # Three single-threaded += operations should add up.
+        self.assertAlmostEqual(s.rate, 3.0)
 
 
 class TestEWMA(unittest.TestCase):
@@ -345,6 +364,9 @@ class TestAppState(unittest.TestCase):
 
 class TestThreadSafety(unittest.TestCase):
     def test_concurrent_updates(self):
+        # Note: this exercises lock robustness, not increment atomicity.
+        # SlidingWindow/PeriodicSum `+=` is intentionally non-atomic across
+        # threads (see SlidingWindow docstring).
         class S(AppState):
             hits = SlidingWindow(window=60.0)
             cpu = EWMA(alpha=0.1)
@@ -356,7 +378,7 @@ class TestThreadSafety(unittest.TestCase):
         def worker():
             try:
                 for _ in range(1000):
-                    s.hits = 1
+                    s.hits += 1
                     s.cpu = 50.0
                     s.latency = 42
                     s.to_dict()
@@ -562,6 +584,89 @@ class TestSampledWindow(unittest.TestCase):
             SampledWindow(window=0)
         with self.assertRaises(ValueError):
             SampledWindow(window=-1)
+
+
+class TestPeriodicSum(unittest.TestCase):
+    def _make_impl(
+        self,
+        reset_at: datetime.time = datetime.time(0, 0),
+        tz: datetime.tzinfo | None = None,
+    ) -> PeriodicSumImpl:
+        return PeriodicSumImpl(reset_at, tz)
+
+    def test_init_zero(self):
+        impl = self._make_impl()
+        self.assertEqual(impl.serialize(), 0.0)
+
+    def test_update_overwrites(self):
+        impl = self._make_impl()
+        impl.update(3)
+        impl.update(2.5)
+        impl.update(1)
+        # Each update assigns absolutely (last write wins).
+        self.assertAlmostEqual(impl.serialize(), 1.0)
+
+    def test_resets_after_period(self):
+        impl = self._make_impl()
+        impl.update(10)
+        self.assertAlmostEqual(impl.serialize(), 10.0)
+        # Pretend the current period started two days ago — next access must reset.
+        impl._period_start -= datetime.timedelta(days=2)
+        self.assertAlmostEqual(impl.serialize(), 0.0)
+        impl.update(4)
+        self.assertAlmostEqual(impl.serialize(), 4.0)
+
+    def test_period_start_for_midnight(self):
+        impl = self._make_impl(reset_at=datetime.time(0, 0))
+        now = datetime.datetime(2026, 4, 10, 15, 30, 0)
+        start = impl._period_start_for(now)
+        self.assertEqual(start, datetime.datetime(2026, 4, 10, 0, 0, 0))
+
+    def test_period_start_for_custom_time_before(self):
+        impl = self._make_impl(reset_at=datetime.time(6, 0))
+        # 05:00 is *before* today's 06:00 reset, so we are still in yesterday's period.
+        now = datetime.datetime(2026, 4, 10, 5, 0, 0)
+        start = impl._period_start_for(now)
+        self.assertEqual(start, datetime.datetime(2026, 4, 9, 6, 0, 0))
+
+    def test_period_start_for_custom_time_after(self):
+        impl = self._make_impl(reset_at=datetime.time(6, 0))
+        # 07:00 is after today's 06:00 reset, so today's period started at 06:00.
+        now = datetime.datetime(2026, 4, 10, 7, 0, 0)
+        start = impl._period_start_for(now)
+        self.assertEqual(start, datetime.datetime(2026, 4, 10, 6, 0, 0))
+
+    def test_with_tz(self):
+        tz = ZoneInfo("Europe/Berlin")
+        impl = self._make_impl(tz=tz)
+        self.assertIsNotNone(impl._period_start.tzinfo)
+        self.assertEqual(impl._period_start.tzinfo, tz)
+        impl.update(2)
+        self.assertAlmostEqual(impl.serialize(), 2.0)
+
+    def test_descriptor_in_appstate(self):
+        class S(AppState):
+            jobs_today = PeriodicSum()
+
+        s = S()
+        self.assertAlmostEqual(s.jobs_today, 0.0)
+        s.jobs_today += 5
+        s.jobs_today += 3
+        self.assertAlmostEqual(s.jobs_today, 8.0)
+
+    def test_assignment_resets_to_value(self):
+        class S(AppState):
+            jobs_today = PeriodicSum()
+
+        s = S()
+        s.jobs_today += 7
+        self.assertAlmostEqual(s.jobs_today, 7.0)
+        s.jobs_today = 0
+        self.assertAlmostEqual(s.jobs_today, 0.0)
+
+    def test_invalid_reset_at(self):
+        with self.assertRaises(TypeError):
+            PeriodicSum(reset_at="00:00")  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":

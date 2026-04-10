@@ -76,7 +76,7 @@ def root():
     elapsed_ms = (time.monotonic() - t0) * 1000
 
     # Update metrics – the descriptor __set__ routes values to the right impl
-    state.request_rate = 1  # count one hit in the sliding window
+    state.request_rate += 1  # count one hit in the sliding window
     state.cpu_usage = 20.0  # fake CPU reading
     state.latency = elapsed_ms  # add a latency sample
     state.status = "running"
