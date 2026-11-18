@@ -301,7 +301,7 @@ class TestIaddAtomicity(unittest.TestCase):
             t.join()
 
         # 10 threads × 1000 increments must be exactly 10000.
-        self.assertAlmostEqual(s.hits._curr, 10000.0)
+        self.assertAlmostEqual(s.hits.serialize(), 10000.0)
 
     def test_periodic_sum_iadd_atomic(self):
         class S(AppState):
@@ -341,7 +341,7 @@ class TestIaddAtomicity(unittest.TestCase):
         for t in threads:
             t.join()
 
-        self.assertAlmostEqual(s.hits._curr, 10000.0)
+        self.assertAlmostEqual(s.hits.serialize(), 10000.0)
 
 
 class TestThreadSafetyToDict(unittest.TestCase):
@@ -374,7 +374,7 @@ class TestThreadSafetyToDict(unittest.TestCase):
 
         self.assertEqual(errors, [], f"Thread errors: {errors}")
         # All 8 × 500 increments must show up.
-        self.assertAlmostEqual(s.hits._curr, 4000.0)
+        self.assertAlmostEqual(s.hits.serialize(), 4000.0)
 
 
 class TestInheritance(unittest.TestCase):

@@ -2,6 +2,19 @@
 
 Format based on [Keep a Changelog](https://keepachangelog.com).
 
+## [0.2.1] — 2026-11-18
+
+### Changed
+
+- **`SlidingWindow`** counts an event for the whole `window`. Until now a single event kept its
+  value only until the next window boundary, anywhere between zero and `window` seconds, and
+  then faded out linearly over another `window`. Now it counts fully for at least
+  `window - window / buckets` seconds and drops out within one bucket
+- **`SlidingWindow(buckets=60)`** is a new keyword argument that sets how many buckets the window
+  is divided into. `buckets=1` gives the previous behaviour
+- **`SlidingWindow.set()`** overwrites the current bucket, which now covers `window / buckets`
+  seconds instead of the time since the last window boundary
+
 ## [0.2.0] — 2026-04-10
 
 The metric-field model has been redesigned. Fields are now plain instance

@@ -209,7 +209,7 @@ The lock is reentrant, so you can call `state.to_dict()` from inside a
 
 | Field | Constructor | Methods | Serialized as |
 |---|---|---|---|
-| `SlidingWindow` | `SlidingWindow(window=60.0)` | `inc`, `set`, `reset`, `+=` | `float` – rate over the window |
+| `SlidingWindow` | `SlidingWindow(window=60.0, buckets=60)` | `inc`, `set`, `reset`, `+=` | `float` – rate over the window |
 | `PeriodicSum` | `PeriodicSum(reset_at=time(0,0), tz=None)` | `inc`, `set`, `reset`, `+=` | `float` – count since last reset |
 | `EWMA` | `EWMA(alpha=0.1, preset=None)` | `update`, `reset` | `float \| None` – current estimate |
 | `RunningStats` | `RunningStats()` | `update`, `reset` | `{"n", "mean", "stddev", "min", "max"}` |
@@ -223,12 +223,18 @@ Method semantics are uniform across fields: `inc` increments a counter,
 There is no method that means "increment on counters but feed sample on
 samplers" – that ambiguity was a 0.1.x footgun and is gone.
 
-**`SlidingWindow(window)`** – rate counter. Returns how many hits accumulated
-in the last `window` seconds, with smooth interpolation at window boundaries.
-Use `state.x.inc()` (or `state.x += n`) to record events; both forms are
-atomic across threads. `state.x.set(value)` overwrites the current bucket
-(useful for syncing to an external counter). `state.x.reset()` clears both
-buckets.
+**`SlidingWindow(window, *, buckets=60)`** – rate counter. Returns how many
+hits were recorded in the last `window` seconds. The window is divided into
+`buckets` buckets of `window / buckets` seconds each. A single event counts
+fully for at least `window - window / buckets` seconds and then drops out
+within one bucket, so in a graph it shows up as a rectangle of width `window`.
+A steady rate gives a steady value. More buckets give sharper edges and cost
+one float each. With `buckets=1` the value is a rough estimate: an event
+counts fully only until the next bucket boundary and then fades out over a
+whole `window`. Use `state.x.inc()` (or `state.x += n`) to record events; both
+forms are atomic across threads. `state.x.set(value)` overwrites the current
+bucket (useful for syncing to an external counter). `state.x.reset()` clears
+all buckets.
 
 **`PeriodicSum(reset_at=time(0,0), tz=None)`** – calendar-aligned counter that
 accumulates events and snaps back to zero at a configurable wall-clock time
